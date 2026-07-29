@@ -276,6 +276,17 @@ impl<R, G, T> ReentrantMutex<R, G, T> {
     pub const fn const_new(raw_mutex: R, get_thread_id: G, val: T) -> ReentrantMutex<R, G, T> {
         Self::from_raw(raw_mutex, get_thread_id, val)
     }
+
+    /// Consumes this mutex, returning the underlying data, raw mutex and
+    /// thread ID helper.
+    #[inline]
+    pub fn into_inner_with_raw(self) -> (R, G, T) {
+        (
+            self.raw.mutex,
+            self.raw.get_thread_id,
+            self.data.into_inner(),
+        )
+    }
 }
 
 impl<R: RawMutex, G: GetThreadId, T: ?Sized> ReentrantMutex<R, G, T> {

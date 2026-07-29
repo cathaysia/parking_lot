@@ -179,6 +179,12 @@ impl<R, T> Mutex<R, T> {
     pub const fn const_new(raw_mutex: R, val: T) -> Mutex<R, T> {
         Self::from_raw(raw_mutex, val)
     }
+
+    /// Consumes this mutex, returning the underlying data and raw mutex.
+    #[inline]
+    pub fn into_inner_with_raw(self) -> (R, T) {
+        (self.raw, self.data.into_inner())
+    }
 }
 
 impl<R: RawMutex, T: ?Sized> Mutex<R, T> {
