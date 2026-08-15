@@ -404,6 +404,12 @@ impl<R, T> RwLock<R, T> {
     pub const fn const_new(raw_rwlock: R, val: T) -> RwLock<R, T> {
         Self::from_raw(raw_rwlock, val)
     }
+
+    /// Consumes this read-write lock, returning the underlying data and raw lock.
+    #[inline]
+    pub fn into_inner_with_raw(self) -> (R, T) {
+        (self.raw, self.data.into_inner())
+    }
 }
 
 impl<R: RawRwLock, T: ?Sized> RwLock<R, T> {
