@@ -116,6 +116,10 @@ parking_lot = { version = "0.12", features = ["nightly"] }
 The experimental deadlock detector can be enabled with the
 `deadlock_detection` Cargo feature.
 
+With this feature enabled, recursive `RwLock` acquisitions are reported as
+warnings on stderr. Set `PARKING_LOT_PANIC_ON_DEADLOCK` to `1`, `true`, `yes`,
+or `on` to panic when such an acquisition is detected.
+
 To allow sending `MutexGuard`s and `RwLock*Guard`s to other threads, enable the
 `send_guard` option.
 

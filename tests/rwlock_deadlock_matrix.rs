@@ -1,20 +1,23 @@
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 #[cfg(feature = "deadlock_detection")]
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Once;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
 const LOCK_TIMEOUT: Duration = Duration::from_millis(20);
-const CASE_TIMEOUT: Duration = Duration::from_millis(200);
+
+#[cfg(feature = "deadlock_detection")]
+fn enable_panic_on_deadlock() {
+    static ENABLE: Once = Once::new();
+    ENABLE.call_once(|| std::env::set_var("PARKING_LOT_PANIC_ON_DEADLOCK", "1"));
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Acquired,
     TimedOut,
 }
-
-type Case = fn(Arc<RwLock<()>>) -> Outcome;
 
 fn outcome<T>(result: Option<T>) -> Outcome {
     if result.is_some() {
@@ -24,32 +27,32 @@ fn outcome<T>(result: Option<T>) -> Outcome {
     }
 }
 
-fn run_case(case: Case) -> Outcome {
-    let lock = Arc::new(RwLock::new(()));
-    let (sender, receiver) = mpsc::channel();
-
-    thread::spawn(move || {
-        sender.send(case(lock)).unwrap();
-    });
-
-    receiver
-        .recv_timeout(CASE_TIMEOUT)
-        .expect("lock matrix case did not finish")
-}
-
-#[cfg(feature = "deadlock_detection")]
-fn run_case_expect_panic(case: Case) -> bool {
-    let lock = Arc::new(RwLock::new(()));
-    let (sender, receiver) = mpsc::channel();
-
-    thread::spawn(move || {
-        let panicked = catch_unwind(AssertUnwindSafe(|| case(lock))).is_err();
-        sender.send(panicked).unwrap();
-    });
-
-    receiver
-        .recv_timeout(CASE_TIMEOUT)
-        .expect("panic matrix case did not finish")
+macro_rules! rwlock_panic_test {
+    (true, $label:literal, $timeout:ident, |$lock:ident| $body:block) => {
+        #[cfg(feature = "deadlock_detection")]
+        #[test]
+        #[should_panic(expected = "parking_lot: possible recursive RwLock deadlock")]
+        fn expect_panic() {
+            enable_panic_on_deadlock();
+            let $lock = Arc::new(RwLock::new(()));
+            let _ = $body;
+        }
+    };
+    (false, $label:literal, $timeout:ident, |$lock:ident| $body:block) => {
+        #[cfg(feature = "deadlock_detection")]
+        #[test]
+        fn expect_no_panic() {
+            enable_panic_on_deadlock();
+            let $lock = Arc::new(RwLock::new(()));
+            let actual = $body;
+            assert_eq!(
+                actual,
+                Outcome::$timeout,
+                "unexpected result for {}",
+                $label
+            );
+        }
+    };
 }
 
 macro_rules! rwlock_matrix {
@@ -57,40 +60,31 @@ macro_rules! rwlock_matrix {
         $(
             $case:ident: $label:literal {
                 timeout: $timeout:ident,
-                panic: $panic:literal,
+                panic: $panic:tt,
                 run: |$lock:ident| $body:block
             }
         ),+ $(,)?
     ) => {
         $(
-            fn $case($lock: Arc<RwLock<()>>) -> Outcome $body
+            mod $case {
+                use super::*;
+
+                #[cfg(not(feature = "deadlock_detection"))]
+                #[test]
+                fn expect_timeout() {
+                    let $lock = Arc::new(RwLock::new(()));
+                    let actual = $body;
+                    assert_eq!(
+                        actual,
+                        Outcome::$timeout,
+                        "unexpected result for {}",
+                        $label
+                    );
+                }
+
+                rwlock_panic_test!($panic, $label, $timeout, |$lock| $body);
+            }
         )+
-
-        #[test]
-        fn test1_rwlock_matrix_expect_timeout() {
-            let cases: &[(&str, Case, Outcome)] = &[
-                $(($label, $case, Outcome::$timeout),)+
-            ];
-
-            for &(name, case, expected) in cases {
-                let actual = run_case(case);
-                assert_eq!(actual, expected, "unexpected result for {name}");
-            }
-        }
-
-        #[cfg(feature = "deadlock_detection")]
-        #[test]
-        #[ignore = "the recursive-lock panic hook is not implemented yet"]
-        fn test2_rwlock_matrix_expect_panic() {
-            let cases: &[(&str, Case, bool)] = &[
-                $(($label, $case, $panic),)+
-            ];
-
-            for &(name, case, expected) in cases {
-                let actual = run_case_expect_panic(case);
-                assert_eq!(actual, expected, "unexpected panic result for {name}");
-            }
-        }
     };
 }
 
@@ -197,6 +191,57 @@ rwlock_matrix! {
             } else {
                 Outcome::TimedOut
             }
+        }
+    },
+    upgrade_drop_upgradable: "upgrade -> drop -> upgradable" {
+        timeout: Acquired,
+        panic: false,
+        run: |lock| {
+            let upgradable = lock.upgradable_read();
+            let write = RwLockUpgradableReadGuard::try_upgrade_for(upgradable, LOCK_TIMEOUT)
+                .ok()
+                .unwrap();
+            drop(write);
+            outcome(lock.try_upgradable_read_for(LOCK_TIMEOUT))
+        }
+    },
+    upgrade_downgrade_read: "upgrade -> downgrade -> read" {
+        timeout: Acquired,
+        panic: true,
+        run: |lock| {
+            let upgradable = lock.upgradable_read();
+            let write = RwLockUpgradableReadGuard::try_upgrade_for(upgradable, LOCK_TIMEOUT)
+                .ok()
+                .unwrap();
+            let _read = RwLockWriteGuard::downgrade(write);
+            outcome(lock.try_read_for(LOCK_TIMEOUT))
+        }
+    },
+    downgrade_read_upgradable: "write -> downgrade -> upgradable" {
+        timeout: Acquired,
+        panic: false,
+        run: |lock| {
+            let write = lock.write();
+            let _read = RwLockWriteGuard::downgrade(write);
+            outcome(lock.try_upgradable_read_for(LOCK_TIMEOUT))
+        }
+    },
+    downgrade_upgradable_read: "write -> downgrade_to_upgradable -> read" {
+        timeout: Acquired,
+        panic: false,
+        run: |lock| {
+            let write = lock.write();
+            let _upgradable = RwLockWriteGuard::downgrade_to_upgradable(write);
+            outcome(lock.try_read_for(LOCK_TIMEOUT))
+        }
+    },
+    downgrade_read_to_upgradable: "upgradable -> downgrade -> upgradable" {
+        timeout: Acquired,
+        panic: false,
+        run: |lock| {
+            let upgradable = lock.upgradable_read();
+            let _read = RwLockUpgradableReadGuard::downgrade(upgradable);
+            outcome(lock.try_upgradable_read_for(LOCK_TIMEOUT))
         }
     }
 }

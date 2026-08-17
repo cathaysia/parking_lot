@@ -2,6 +2,10 @@
 //!
 //! This feature is optional and can be enabled via the `deadlock_detection` feature flag.
 //!
+//! When this feature is enabled, recursive `RwLock` acquisitions are reported
+//! to stderr. Set `PARKING_LOT_PANIC_ON_DEADLOCK` to `1`, `true`, `yes`, or
+//! `on` to panic instead.
+//!
 //! # Example
 //!
 //! ```
@@ -36,6 +40,49 @@
 #[cfg(feature = "deadlock_detection")]
 pub use parking_lot_core::deadlock::check_deadlock;
 pub(crate) use parking_lot_core::deadlock::{acquire_resource, release_resource};
+
+#[derive(Clone, Copy)]
+pub(crate) enum RwLockMode {
+    Read,
+    RecursiveRead,
+    Upgradable,
+    Write,
+}
+
+#[inline]
+pub(crate) unsafe fn check_rwlock_acquire(_key: usize, _mode: RwLockMode) {
+    #[cfg(feature = "deadlock_detection")]
+    parking_lot_core::deadlock::check_rwlock_acquire(_key, to_core_mode(_mode));
+}
+
+#[inline]
+pub(crate) unsafe fn acquire_rwlock(_key: usize, _mode: RwLockMode) {
+    #[cfg(feature = "deadlock_detection")]
+    parking_lot_core::deadlock::acquire_rwlock(_key, to_core_mode(_mode));
+}
+
+#[inline]
+pub(crate) unsafe fn release_rwlock(_key: usize, _mode: RwLockMode) {
+    #[cfg(feature = "deadlock_detection")]
+    parking_lot_core::deadlock::release_rwlock(_key, to_core_mode(_mode));
+}
+
+#[inline]
+pub(crate) unsafe fn transition_rwlock(_key: usize, _from: RwLockMode, _to: RwLockMode) {
+    #[cfg(feature = "deadlock_detection")]
+    parking_lot_core::deadlock::transition_rwlock(_key, to_core_mode(_from), to_core_mode(_to));
+}
+
+#[cfg(feature = "deadlock_detection")]
+#[inline]
+fn to_core_mode(mode: RwLockMode) -> parking_lot_core::deadlock::RwLockMode {
+    match mode {
+        RwLockMode::Read => parking_lot_core::deadlock::RwLockMode::Read,
+        RwLockMode::RecursiveRead => parking_lot_core::deadlock::RwLockMode::RecursiveRead,
+        RwLockMode::Upgradable => parking_lot_core::deadlock::RwLockMode::Upgradable,
+        RwLockMode::Write => parking_lot_core::deadlock::RwLockMode::Write,
+    }
+}
 
 #[cfg(test)]
 #[cfg(feature = "deadlock_detection")]

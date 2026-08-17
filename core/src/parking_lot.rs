@@ -1130,6 +1130,75 @@ pub mod deadlock {
         deadlock_impl::release_resource(_key);
     }
 
+    /// The kind of access held on an `RwLock` for recursive-lock detection.
+    #[derive(Clone, Copy, Debug)]
+    pub enum RwLockMode {
+        /// An ordinary shared read access.
+        Read,
+        /// An explicitly recursive shared read access.
+        RecursiveRead,
+        /// An upgradable shared access.
+        Upgradable,
+        /// An exclusive write access.
+        Write,
+    }
+
+    /// Checks whether acquiring an `RwLock` may deadlock with a lock held by
+    /// the current thread.
+    ///
+    /// With `deadlock_detection` disabled this is a no-op. With it enabled,
+    /// a warning is printed to stderr when a recursive acquisition is found.
+    /// Set `PARKING_LOT_PANIC_ON_DEADLOCK` to `1`, `true`, `yes`, or `on` to
+    /// panic instead of printing the warning.
+    ///
+    /// # Safety
+    ///
+    /// `key` must identify a live `RwLock` for the duration of the call.
+    #[inline]
+    pub unsafe fn check_rwlock_acquire(_key: usize, _mode: RwLockMode) {
+        #[cfg(feature = "deadlock_detection")]
+        deadlock_impl::check_rwlock_acquire(_key, _mode);
+    }
+
+    /// Records a successfully acquired `RwLock` access.
+    ///
+    /// With `deadlock_detection` disabled this is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// Call this only after the access has been acquired.
+    #[inline]
+    pub unsafe fn acquire_rwlock(_key: usize, _mode: RwLockMode) {
+        #[cfg(feature = "deadlock_detection")]
+        deadlock_impl::acquire_rwlock(_key, _mode);
+    }
+
+    /// Records a released `RwLock` access.
+    ///
+    /// With `deadlock_detection` disabled this is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// Call this only immediately before releasing the access.
+    #[inline]
+    pub unsafe fn release_rwlock(_key: usize, _mode: RwLockMode) {
+        #[cfg(feature = "deadlock_detection")]
+        deadlock_impl::release_rwlock(_key, _mode);
+    }
+
+    /// Records an atomic `RwLock` access-mode transition.
+    ///
+    /// With `deadlock_detection` disabled this is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// The current thread must hold the access described by `from`.
+    #[inline]
+    pub unsafe fn transition_rwlock(_key: usize, _from: RwLockMode, _to: RwLockMode) {
+        #[cfg(feature = "deadlock_detection")]
+        deadlock_impl::transition_rwlock(_key, _from, _to);
+    }
+
     /// Returns all deadlocks detected *since* the last call.
     /// Each cycle consist of a vector of `DeadlockedThread`.
     #[cfg(feature = "deadlock_detection")]
@@ -1154,9 +1223,9 @@ mod deadlock_impl {
     use petgraph;
     use petgraph::graphmap::DiGraphMap;
     use std::cell::{Cell, UnsafeCell};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, OnceLock};
     use std::thread::ThreadId;
 
     /// Representation of a deadlocked thread
@@ -1181,6 +1250,9 @@ mod deadlock_impl {
         // Currently owned resources (keys)
         resources: UnsafeCell<Vec<usize>>,
 
+        // RwLocks currently held by this thread, keyed by lock address.
+        rwlocks: UnsafeCell<HashMap<usize, HeldRwLock>>,
+
         // Set when there's a pending callstack request
         deadlocked: Cell<bool>,
 
@@ -1191,10 +1263,18 @@ mod deadlock_impl {
         thread_id: ThreadId,
     }
 
+    #[derive(Default)]
+    struct HeldRwLock {
+        reads: usize,
+        upgradable: bool,
+        write: bool,
+    }
+
     impl DeadlockData {
         pub fn new() -> Self {
             DeadlockData {
                 resources: UnsafeCell::new(Vec::new()),
+                rwlocks: UnsafeCell::new(HashMap::new()),
                 deadlocked: Cell::new(false),
                 backtrace_sender: UnsafeCell::new(None),
                 thread_id: std::thread::current().id(),
@@ -1239,6 +1319,144 @@ mod deadlock_impl {
                 resources.swap_remove(p);
             }
         });
+    }
+
+    pub unsafe fn check_rwlock_acquire(key: usize, mode: super::deadlock::RwLockMode) {
+        with_thread_data(|thread_data| {
+            let rwlocks = &*thread_data.deadlock_data.rwlocks.get();
+            let Some(held) = rwlocks.get(&key) else {
+                return;
+            };
+
+            let recursive = match mode {
+                super::deadlock::RwLockMode::Read => held.reads != 0 || held.write,
+                super::deadlock::RwLockMode::RecursiveRead => held.write,
+                super::deadlock::RwLockMode::Upgradable => held.upgradable || held.write,
+                super::deadlock::RwLockMode::Write => {
+                    held.reads != 0 || held.upgradable || held.write
+                }
+            };
+
+            if recursive {
+                report_recursive_deadlock(key, mode);
+            }
+        });
+    }
+
+    pub unsafe fn acquire_rwlock(key: usize, mode: super::deadlock::RwLockMode) {
+        with_thread_data(|thread_data| {
+            let rwlocks = &mut *thread_data.deadlock_data.rwlocks.get();
+            let held = rwlocks.entry(key).or_default();
+            match mode {
+                super::deadlock::RwLockMode::Read | super::deadlock::RwLockMode::RecursiveRead => {
+                    held.reads += 1;
+                }
+                super::deadlock::RwLockMode::Upgradable => {
+                    debug_assert!(!held.upgradable);
+                    held.upgradable = true;
+                }
+                super::deadlock::RwLockMode::Write => {
+                    debug_assert!(!held.write);
+                    held.write = true;
+                }
+            }
+        });
+    }
+
+    pub unsafe fn release_rwlock(key: usize, mode: super::deadlock::RwLockMode) {
+        with_thread_data(|thread_data| {
+            let rwlocks = &mut *thread_data.deadlock_data.rwlocks.get();
+            let Some(held) = rwlocks.get_mut(&key) else {
+                return;
+            };
+
+            match mode {
+                super::deadlock::RwLockMode::Read | super::deadlock::RwLockMode::RecursiveRead => {
+                    debug_assert!(held.reads != 0);
+                    held.reads = held.reads.saturating_sub(1);
+                }
+                super::deadlock::RwLockMode::Upgradable => {
+                    debug_assert!(held.upgradable);
+                    held.upgradable = false;
+                }
+                super::deadlock::RwLockMode::Write => {
+                    debug_assert!(held.write);
+                    held.write = false;
+                }
+            }
+
+            if held.reads == 0 && !held.upgradable && !held.write {
+                rwlocks.remove(&key);
+            }
+        });
+    }
+
+    pub unsafe fn transition_rwlock(
+        key: usize,
+        from: super::deadlock::RwLockMode,
+        to: super::deadlock::RwLockMode,
+    ) {
+        with_thread_data(|thread_data| {
+            let rwlocks = &mut *thread_data.deadlock_data.rwlocks.get();
+            let Some(held) = rwlocks.get_mut(&key) else {
+                return;
+            };
+
+            match from {
+                super::deadlock::RwLockMode::Read | super::deadlock::RwLockMode::RecursiveRead => {
+                    debug_assert!(held.reads != 0);
+                    held.reads = held.reads.saturating_sub(1);
+                }
+                super::deadlock::RwLockMode::Upgradable => {
+                    debug_assert!(held.upgradable);
+                    held.upgradable = false;
+                }
+                super::deadlock::RwLockMode::Write => {
+                    debug_assert!(held.write);
+                    held.write = false;
+                }
+            }
+
+            match to {
+                super::deadlock::RwLockMode::Read | super::deadlock::RwLockMode::RecursiveRead => {
+                    held.reads += 1;
+                }
+                super::deadlock::RwLockMode::Upgradable => {
+                    debug_assert!(!held.upgradable);
+                    held.upgradable = true;
+                }
+                super::deadlock::RwLockMode::Write => {
+                    debug_assert!(!held.write);
+                    held.write = true;
+                }
+            }
+        });
+    }
+
+    fn report_recursive_deadlock(key: usize, mode: super::deadlock::RwLockMode) {
+        if panic_on_deadlock() {
+            panic!(
+                "parking_lot: possible recursive RwLock deadlock at 0x{key:x} while acquiring {mode:?}"
+            );
+        }
+        eprintln!(
+            "parking_lot: possible recursive RwLock deadlock at 0x{key:x} while acquiring {mode:?}"
+        );
+    }
+
+    fn panic_on_deadlock() -> bool {
+        static PANIC_ON_DEADLOCK: OnceLock<bool> = OnceLock::new();
+
+        *PANIC_ON_DEADLOCK.get_or_init(|| {
+            let Ok(value) = std::env::var("PARKING_LOT_PANIC_ON_DEADLOCK") else {
+                return false;
+            };
+            let value = value.trim();
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
     }
 
     pub fn check_deadlock() -> Vec<Vec<DeadlockedThread>> {
